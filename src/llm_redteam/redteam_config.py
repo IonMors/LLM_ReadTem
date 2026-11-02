@@ -11,7 +11,10 @@ def get_vulnerabilities():
     """
 
     prompt_leakage = PromptLeakage(
-        types=["system_prompt"],
+        # "system_prompt" was renamed in deepteam — use "instructions" instead.
+        # Valid types: "secrets_and_credentials", "instructions",
+        #              "guard_exposure", "permissions_and_roles"
+        types=["instructions"],
     )
 
     pii_leakage = PIILeakage(

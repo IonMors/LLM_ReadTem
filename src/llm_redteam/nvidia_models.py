@@ -1,32 +1,35 @@
 
 import os
-import json
 
 from dotenv import load_dotenv
-from deepeval.models import DeepEvalBaseLLM
 from deepeval.metrics.utils import trimAndLoadJson
-from openai import OpenAI, AsyncOpenAI
-from pydantic import BaseModel
-
+from deepeval.models import DeepEvalBaseLLM
+from openai import AsyncOpenAI, OpenAI
 
 load_dotenv()
 
-# Nemotron-3.5-Super is a reasoning model: it spends tokens on internal
-# chain-of-thought (reasoning_content) BEFORE writing content.
-# DeepTeam sends long structured prompts, so we need a large token budget.
 _MAX_TOKENS = 8192
 
 
 class NvidiaModel(DeepEvalBaseLLM):
-    """
-    NVIDIA-hosted model adapter for DeepTeam.
-    Implements the DeepEvalBaseLLM interface.
-    """
+    # Adapter that lets DeepEval/DeepTeam call an NVIDIA-hosted model
+    # through the OpenAI-compatible API.
 
     def __init__(self, model: str | None = None):
+        # An explicitly supplied model name takes priority over .env settings.
         self.model = model or os.getenv("NVIDIA_MODEL")
 
-        nvidia_config = dict(
+        # NVIDIA's endpoint exposes an OpenAI-compatible chat-completions API.
+        self.client = OpenAI(
+            api_key=os.getenv("NVIDIA_API_KEY"),
+            base_url=os.getenv(
+                "NVIDIA_BASE_URL",
+                "https://integrate.api.nvidia.com/v1",
+            ),
+        )
+        # DeepTeam can execute model calls asynchronously, so use a separate
+        # async client instead of awaiting the synchronous OpenAI client.
+        self.async_client = AsyncOpenAI(
             api_key=os.getenv("NVIDIA_API_KEY"),
             base_url=os.getenv(
                 "NVIDIA_BASE_URL",
@@ -34,71 +37,64 @@ class NvidiaModel(DeepEvalBaseLLM):
             ),
         )
 
-        # Synchronous client for generate()
-        self.client = OpenAI(**nvidia_config)
-
-        # Async client for a_generate() — OpenAI client is NOT awaitable
-        self.async_client = AsyncOpenAI(**nvidia_config)
-
     def load_model(self):
+        # DeepEval uses this hook to access the underlying client object.
         return self.client
 
     def _extract_content(self, response) -> str:
-        """
-        Extract text from the API response.
-
-        Nemotron-3.5-Super is a reasoning model — its final answer lives in
-        `content`, while internal thinking lives in `reasoning_content`.
-        If `content` is None the model ran out of tokens before writing its
-        answer; raise so callers can handle / retry.
-        """
-        msg = response.choices[0].message
-        content = msg.content
-
+        content = response.choices[0].message.content
         if not content:
-            thinking = getattr(msg, "reasoning_content", None) or ""
-            raise ValueError(
-                f"Model returned empty content (finish_reason="
-                f"{response.choices[0].finish_reason!r}). "
-                f"The reasoning trace consumed all tokens. "
-                f"Increase max_tokens. Thinking preview: {thinking[:200]!r}"
-            )
-
+            raise ValueError("The NVIDIA model returned no final content")
         return content.strip()
 
     def _parse_with_schema(self, text: str, schema: type | None):
-        """
-        If a Pydantic schema is provided, parse the JSON text and return a
-        schema instance. DeepTeam checks isinstance(res, schema) to decide
-        whether to use the object directly or call trimAndLoadJson on it.
-        Returning the right type avoids the 'str has no attribute .data' error.
-        """
+        # DeepTeam passes Pydantic schemas for structured attack generation.
         if schema is None:
             return text
+        return schema(**trimAndLoadJson(text))
 
-        data = trimAndLoadJson(text)
-        return schema(**data)
+    def _request_options(self, schema: type | None) -> dict:
+        # JSON mode alone only guarantees valid JSON; it does not guarantee
+        # required fields such as SyntheticDataList.data or ReasonScore.score.
+        if schema is not None:
+            return {
+                "reasoning_effort": "none",
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema.__name__,
+                        "strict": True,
+                        "schema": schema.model_json_schema(),
+                    },
+                },
+            }
+        return {}
 
-    def generate(self, prompt: str, schema: type | None = None, **kwargs) -> str:
+    def generate(self, prompt: str, schema: type | None = None, **kwargs):
+        # Synchronous generation for callers that do not use async workflows.
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
+            # Increase this if the model's reasoning consumes the full budget
+            # before it writes its final answer.
             max_tokens=_MAX_TOKENS,
+            **self._request_options(schema),
         )
-        text = self._extract_content(response)
-        return self._parse_with_schema(text, schema)
 
-    async def a_generate(self, prompt: str, schema: type | None = None, **kwargs) -> str:
-        # Use AsyncOpenAI so .create() returns a coroutine that can be awaited
+        return self._parse_with_schema(self._extract_content(response), schema)
+
+    async def a_generate(self, prompt: str, schema: type | None = None, **kwargs):
         response = await self.async_client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             max_tokens=_MAX_TOKENS,
+            **self._request_options(schema),
         )
-        text = self._extract_content(response)
-        return self._parse_with_schema(text, schema)
+
+        return self._parse_with_schema(self._extract_content(response), schema)
 
     def get_model_name(self) -> str:
+        # DeepEval uses this name in logs and evaluation output.
         return self.model
